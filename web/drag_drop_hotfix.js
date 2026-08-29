@@ -111,6 +111,21 @@ function setWidgetValue(node, name, value) {
     node.graph?.setDirtyCanvas(true, true);
 }
 
+function preserveImageWidgetValue(node) {
+    for (const widget of node?.widgets ?? []) {
+        const options = widget.options ?? widget.spec;
+        const isImageWidget = options?.image_upload === true
+            || options?.animated_image_upload === true
+            || (widget.name === "image" && Array.isArray(options?.values));
+        if (!isImageWidget || widget.value == null || String(widget.value).trim() === "") continue;
+
+        const values = options?.values;
+        if (Array.isArray(values) && !values.includes(widget.value)) {
+            values.push(widget.value);
+        }
+    }
+}
+
 async function uploadToNode(node, config, file) {
     if (node.isUploading) return;
 
@@ -141,10 +156,58 @@ async function loadWorkflowFile(file) {
     // the dropped file as the workflow source, so the tab gets its filename
     // and workflow actions such as Rename remain available (same as Ctrl+O).
     await app.handleFile(file, "file_drop", { deferWarnings: true });
+    preserveMissingImageSelections();
+}
+
+function preserveMissingImageSelections() {
+    for (const node of app.graph?._nodes ?? []) {
+        preserveImageWidgetValue(node);
+        for (const widget of node.widgets ?? []) {
+            const options = widget.options ?? widget.spec;
+            const isImageWidget = options?.image_upload === true
+                || options?.animated_image_upload === true
+                || (widget.name === "image" && Array.isArray(options?.values));
+            if (!isImageWidget || widget.value == null || String(widget.value).trim() === "") continue;
+
+            const values = options?.values;
+            // Keep the workflow's original filename visible. Adding it to the
+            // local combo options prevents the frontend from marking it as an
+            // invalid selection, while the backend hotfix handles the missing
+            // file without attempting to load it.
+            if (Array.isArray(values) && !values.includes(widget.value)) {
+                values.push(widget.value);
+            }
+        }
+        node.setDirtyCanvas?.(true, true);
+    }
+    app.graph?.setDirtyCanvas?.(true, true);
 }
 
 app.registerExtension({
     name: "Comfy.DragDropHotfix",
+    async beforeRegisterNodeDef(nodeType, nodeData) {
+        const inputs = nodeData?.input;
+        const sections = [inputs?.required, inputs?.optional];
+        const isImageLoader = sections.some((section) => Object.values(section ?? {}).some((spec) => {
+            const options = Array.isArray(spec) ? spec[1] : spec;
+            return options?.image_upload === true || options?.animated_image_upload === true;
+        }));
+        if (!isImageLoader || nodeType.prototype._goohaiPreserveImageValueInstalled) return;
+
+        const originalConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (...args) {
+            const result = originalConfigure?.apply(this, args);
+            preserveImageWidgetValue(this);
+            return result;
+        };
+        const originalCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function (...args) {
+            const result = originalCreated?.apply(this, args);
+            preserveImageWidgetValue(this);
+            return result;
+        };
+        nodeType.prototype._goohaiPreserveImageValueInstalled = true;
+    },
     init() {
         // The bundled frontend also ships an older workflow_drop_hotfix.js
         // that uses HOTFIX_FLAG. Extension init hooks run before setup hooks,
