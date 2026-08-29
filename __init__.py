@@ -6,6 +6,16 @@ def _empty(value):
     return value is None or str(value).strip().lower() in {"", "none", "null", "无"}
 
 
+def _missing_image(value):
+    if _empty(value):
+        return True
+    try:
+        import folder_paths
+        return not folder_paths.exists_annotated_filepath(str(value))
+    except Exception:
+        return False
+
+
 def _image_input(node_class):
     try:
         inputs = node_class.INPUT_TYPES()
@@ -39,7 +49,7 @@ def _patch_image_loaders():
         if original_validate:
             @classmethod
             def validate_inputs(cls, _image_input=image_input, _original_validate=original_validate, **kwargs):
-                return True if _empty(kwargs.get(_image_input)) else _original_validate(**kwargs)
+                return True if _missing_image(kwargs.get(_image_input)) else _original_validate(**kwargs)
             node_class.VALIDATE_INPUTS = validate_inputs
         function_name = getattr(node_class, "FUNCTION", None)
         original_function = getattr(node_class, function_name, None)
@@ -51,13 +61,13 @@ def _patch_image_loaders():
                         value = args[list(_node_class.INPUT_TYPES().get("required", {})).index(_image_input)]
                     except (ValueError, IndexError):
                         pass
-                return _empty_outputs(_node_class) if _empty(value) else _original_function(self, *args, **kwargs)
+                return _empty_outputs(_node_class) if _missing_image(value) else _original_function(self, *args, **kwargs)
             setattr(node_class, function_name, safe_function)
         original_changed = getattr(node_class, "IS_CHANGED", None)
         if original_changed:
             @classmethod
             def is_changed(cls, _image_input=image_input, _original_changed=original_changed, **kwargs):
-                return "empty" if _empty(kwargs.get(_image_input)) else _original_changed(**kwargs)
+                return "empty" if _missing_image(kwargs.get(_image_input)) else _original_changed(**kwargs)
             node_class.IS_CHANGED = is_changed
         node_class._goohai_empty_image_loader = True
 
