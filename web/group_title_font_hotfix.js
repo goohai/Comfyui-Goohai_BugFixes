@@ -747,6 +747,7 @@ function installRightDragFontGesture() {
         }
 
         const point = knownGroup ? null : canvas.convertEventToCanvasOffset(event);
+        if (!knownGroup && point && canvas.graph?.getNodeOnPos?.(point[0], point[1])) return false;
         const group = knownGroup
             ?? canvas.graph?.getGroupTitlebarOnPos?.(point[0], point[1]);
         if (!group) return false;
@@ -778,6 +779,7 @@ function installRightDragFontGesture() {
     window.addEventListener("pointerdown", (event) => {
         if (event.button !== 2 || gesture) return;
         const point = canvas.convertEventToCanvasOffset(event);
+        if (point && canvas.graph?.getNodeOnPos?.(point[0], point[1])) return;
         const group = point
             ? canvas.graph?.getGroupTitlebarOnPos?.(point[0], point[1])
             : null;
@@ -788,6 +790,8 @@ function installRightDragFontGesture() {
         }
     }, true);
     canvasElement.addEventListener("pointerdown", (event) => {
+        const point = canvas.convertEventToCanvasOffset(event);
+        if (point && canvas.graph?.getNodeOnPos?.(point[0], point[1])) return;
         startGesture(event);
     }, true);
 
@@ -860,6 +864,13 @@ function patchCanvasPrototype() {
             const group = Number.isFinite(x) && Number.isFinite(y)
                 ? graph?.getGroupTitlebarOnPos?.(x, y)
                 : null;
+
+            const nodeAtPoint = Number.isFinite(x) && Number.isFinite(y)
+                ? graph?.getNodeOnPos?.(x, y)
+                : null;
+            if (nodeAtPoint && nodeAtPoint !== group) {
+                return originalPrimaryButton.call(this, event, nodeAtPoint, ...args);
+            }
 
             if (!group) return originalPrimaryButton.call(this, event, node, ...args);
 
