@@ -42,6 +42,40 @@ function getSingleJsonFile(event) {
     return file.name.toLowerCase().endsWith(".json") ? file : null;
 }
 
+function getSingleFile(event) {
+    const files = event.dataTransfer?.files;
+    return files && files.length === 1 ? files[0] : null;
+}
+
+function isImageFile(file) {
+    return Boolean(file) && (file.type.startsWith("image/") || mediaTypes.image.accepts(file));
+}
+
+async function imageHasWorkflowMetadata(file) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    // PNG workflow data is stored in tEXt/iTXt/zTXt chunks. Checking the
+    // chunk text avoids sending ordinary images through handleFile (which can
+    // create a LoadImage node when no graph is present).
+    if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+        const text = new TextDecoder("latin1").decode(bytes);
+        return /(?:workflow|prompt|comfyui)/i.test(text);
+    }
+    // JPEG/WebP metadata is connector/version dependent; the same marker
+    // check covers the JSON text used by ComfyUI exporters without decoding
+    // or rewriting the image.
+    const text = new TextDecoder("latin1").decode(bytes);
+    return /(?:workflow|prompt|comfyui)/i.test(text);
+}
+
+function showNoWorkflowToast() {
+    app.extensionManager?.toast?.add?.({
+        severity: "info",
+        summary: "未找到工作流数据",
+        detail: "图像中没有找到 ComfyUI 工作流数据。",
+        life: 3500,
+    });
+}
+
 function getDeclaredMediaConfigs(node) {
     const inputs = node?.constructor?.nodeData?.input;
     const configs = [];
@@ -221,7 +255,8 @@ app.registerExtension({
 
         window.addEventListener("dragover", (event) => {
             const mediaTarget = getMediaTarget(event);
-            if (!getSingleJsonFile(event) && (!mediaTarget || !event.dataTransfer?.types?.includes("Files"))) return;
+            const file = getSingleFile(event);
+            if (!getSingleJsonFile(event) && !isImageFile(file) && (!mediaTarget || !event.dataTransfer?.types?.includes("Files"))) return;
 
             event.preventDefault();
             if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
@@ -239,8 +274,28 @@ app.registerExtension({
                 return;
             }
 
-            const file = getSingleJsonFile(event);
+            const file = getSingleFile(event);
             if (!file) return;
+
+            // Images dropped on the canvas may contain ComfyUI workflow/prompt
+            // metadata (normally PNG tEXt/iTXt chunks). Delegate to the
+            // official handler so it can restore the graph exactly like the
+            // built-in Ctrl+O/image-drop path. Plain images are handled by the
+            // same fallback as the stock frontend.
+            if (isImageFile(file)) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                imageHasWorkflowMetadata(file).then((hasWorkflow) => {
+                    if (hasWorkflow) return loadWorkflowFile(file);
+                    showNoWorkflowToast();
+                    return undefined;
+                }).catch((error) => {
+                    console.error("Workflow image metadata check failed:", error);
+                });
+                return;
+            }
+
+            if (!file.name.toLowerCase().endsWith(".json")) return;
 
             event.preventDefault();
             event.stopImmediatePropagation();
