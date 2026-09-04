@@ -3,6 +3,7 @@ import { api } from "/scripts/api.js";
 
 const HOTFIX_FLAG = "comfyuiWorkflowDropHotfixInstalled";
 const GOOHAI_HOTFIX_FLAG = "comfyuiGoohaiWorkflowDropHotfixInstalled";
+let workflowDropSequence = 0;
 
 const mediaTypes = {
     image: {
@@ -131,6 +132,26 @@ function getMediaTarget(event, file = null) {
     return config ? { node, config } : null;
 }
 
+// Some custom nodes (for example MiniMax-H3 Integration) render their own
+// HTML drop zones inside a LiteGraph node instead of declaring an
+// `image_upload` widget.  Because this hotfix listens during the window
+// capture phase, it must leave those DOM drop zones untouched so their own
+// handlers can receive the file.
+function isNodeOwnedDropTarget(event) {
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    const candidates = path.length ? path : [event.target];
+    for (const item of candidates) {
+        if (!(item instanceof Element)) continue;
+        if (item.matches("input[type='file'], [data-ghh3-drop-slot], .ghh3-drop, .ghh3-dynamic")) {
+            return true;
+        }
+        if (item.closest?.("input[type='file'], [data-ghh3-drop-slot], .ghh3-drop, .ghh3-dynamic")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function setWidgetValue(node, name, value) {
     const widget = node.widgets?.find((widget) => widget.name === name);
     if (!widget) throw new Error(`Widget '${name}' was not found on ${node.type}`);
@@ -189,8 +210,35 @@ async function loadWorkflowFile(file) {
     // loadGraphData directly. Besides parsing the graph, handleFile registers
     // the dropped file as the workflow source, so the tab gets its filename
     // and workflow actions such as Rename remain available (same as Ctrl+O).
-    await app.handleFile(file, "file_drop", { deferWarnings: true });
+    //
+    // Always give a dropped workflow a fresh source name.  The frontend uses
+    // that source path to identify an open workflow; passing the original
+    // filename can therefore resolve to the currently edited tab when two
+    // drops have the same name.  A unique imported filename forces creation
+    // of a separate tab while retaining the original name as its base.
+    const sourceFile = makeUniqueWorkflowSourceFile(file);
+    await app.handleFile(sourceFile, "file_drop", { deferWarnings: true });
     preserveMissingImageSelections();
+}
+
+function makeUniqueWorkflowSourceFile(file) {
+    const originalName = file?.name || "workflow.json";
+    const match = originalName.match(/^(.*?)(\.[^.]+)?$/);
+    const stem = match?.[1] || "workflow";
+    const extension = match?.[2] || ".json";
+    workflowDropSequence = (workflowDropSequence + 1) % 1000;
+    const suffix = `${Date.now()}-${workflowDropSequence}`;
+    try {
+        return new File([file], `${stem} (imported ${suffix})${extension}`, {
+            type: file.type || "application/json",
+            lastModified: file.lastModified,
+        });
+    } catch {
+        // Older embedded browsers may not expose the File constructor.  In
+        // that case the original file remains loadable, albeit without the
+        // collision-avoidance suffix.
+        return file;
+    }
 }
 
 function preserveMissingImageSelections() {
@@ -254,6 +302,8 @@ app.registerExtension({
         window[GOOHAI_HOTFIX_FLAG] = true;
 
         window.addEventListener("dragover", (event) => {
+            if (isNodeOwnedDropTarget(event)) return;
+
             const mediaTarget = getMediaTarget(event);
             const file = getSingleFile(event);
             if (!getSingleJsonFile(event) && !isImageFile(file) && (!mediaTarget || !event.dataTransfer?.types?.includes("Files"))) return;
@@ -263,6 +313,8 @@ app.registerExtension({
         }, true);
 
         window.addEventListener("drop", (event) => {
+            if (isNodeOwnedDropTarget(event)) return;
+
             const files = Array.from(event.dataTransfer?.files ?? []);
             const mediaTarget = files.length === 1 ? getMediaTarget(event, files[0]) : null;
             if (mediaTarget) {
