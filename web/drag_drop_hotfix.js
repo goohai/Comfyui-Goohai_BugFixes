@@ -33,6 +33,14 @@ const legacyMediaNodes = {
         widget: "audio",
         ...mediaTypes.audio,
     },
+    // VideoHelperSuite adds its upload button and drag handlers at runtime,
+    // so the backend node definition does not expose a `video_upload` flag
+    // for the generic detector above.  Declare the upload widget here and
+    // keep the fix isolated from VHS itself.
+    VHS_LoadVideo: {
+        widget: "video",
+        ...mediaTypes.video,
+    },
 };
 
 function getSingleJsonFile(event) {
