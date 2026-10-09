@@ -4,6 +4,7 @@ import { api } from "/scripts/api.js";
 const HOTFIX_FLAG = "comfyuiWorkflowDropHotfixInstalled";
 const GOOHAI_HOTFIX_FLAG = "comfyuiGoohaiWorkflowDropHotfixInstalled";
 let workflowDropSequence = 0;
+let workflowDropQueue = Promise.resolve();
 
 const mediaTypes = {
     image: {
@@ -213,20 +214,132 @@ async function uploadToNode(node, config, file) {
     }
 }
 
-async function loadWorkflowFile(file) {
-    // Reuse ComfyUI's official file-loading path instead of calling
-    // loadGraphData directly. Besides parsing the graph, handleFile registers
-    // the dropped file as the workflow source, so the tab gets its filename
-    // and workflow actions such as Rename remain available (same as Ctrl+O).
-    //
-    // Always give a dropped workflow a fresh source name.  The frontend uses
-    // that source path to identify an open workflow; passing the original
-    // filename can therefore resolve to the currently edited tab when two
-    // drops have the same name.  A unique imported filename forces creation
-    // of a separate tab while retaining the original name as its base.
-    const sourceFile = makeUniqueWorkflowSourceFile(file);
-    await app.handleFile(sourceFile, "file_drop", { deferWarnings: true });
-    preserveMissingImageSelections();
+function loadWorkflowFile(file) {
+    // Graph loading mutates shared canvas/store state. Keep consecutive drops
+    // ordered, including when an earlier import failed.
+    const load = workflowDropQueue.then(() => importWorkflowFile(file));
+    workflowDropQueue = load.catch(() => {});
+    return load;
+}
+
+function parseWorkflowJson(text) {
+    const source = text.replace(/^\uFEFF/, "");
+    try {
+        return JSON.parse(source);
+    } catch {
+        // Python exporters can emit bare non-finite numbers. Leave matching
+        // text inside quoted strings untouched (including escaped quotes).
+        return JSON.parse(source.replace(
+            /"(?:\\.|[^"\\])*"|(?<![\w.-])(-?Infinity|NaN)(?![\w.])/g,
+            (match, token) => token ? "null" : match,
+        ));
+    }
+}
+
+function getWorkflowStore() {
+    return app.extensionManager?.workflow;
+}
+
+function getAvailableWorkflowName(file) {
+    const stem = (file.name || "workflow.json").replace(/\.[^.]+$/, "");
+    const store = getWorkflowStore();
+    // Frontends predating the exposed workflow store cannot be queried for
+    // name collisions. Retain the old unique-name fallback on those versions.
+    if (!store) return makeUniqueWorkflowSourceFile(file).name.replace(/\.[^.]+$/, "");
+    let name = stem;
+    let counter = 2;
+    const exists = (candidate) => store?.getWorkflowByPath?.(`workflows/${candidate}.json`)
+        || store?.workflows?.some((workflow) => workflow.path === `workflows/${candidate}.json`);
+    while (exists(name)) name = `${stem} (${counter++})`;
+    return name;
+}
+
+async function readImageWorkflowMetadata(file) {
+    const readerName = file.type === "image/png" || /\.png$/i.test(file.name) ? "getPngMetadata"
+        : file.type === "image/webp" || /\.webp$/i.test(file.name) ? "getWebpMetadata"
+        : file.type === "image/avif" || /\.avif$/i.test(file.name) ? "getAvifMetadata"
+        : null;
+    if (!readerName) return null;
+    // Use the same metadata readers as ComfyUI, but load the extracted graph
+    // through our explicit workflow identity rather than handleFile's fallback.
+    const readers = window.comfyAPI?.pnginfo ?? await import("/scripts/pnginfo.js");
+    const reader = readers[readerName];
+    return reader ? await reader(file) : null;
+}
+
+async function importWorkflowFile(file) {
+    const isJson = file.name.toLowerCase().endsWith(".json");
+    const metadata = isJson ? null : await readImageWorkflowMetadata(file);
+    if (!isJson && !metadata) {
+        // Keep ComfyUI's metadata readers for workflow images and other media.
+        await app.handleFile(makeUniqueWorkflowSourceFile(file), "file_drop", { deferWarnings: true });
+        preserveMissingImageSelections();
+        return;
+    }
+
+    const data = isJson ? parseWorkflowJson(await file.text()) : metadata;
+    // Never parse or convert prompt data when a complete UI workflow exists.
+    // API data omits groups, unexecuted nodes and original layout. In recent
+    // frontends handleFile also falls back to it on graph-lifecycle errors.
+    const rawWorkflow = data?.workflow ?? data?.Workflow ?? (isJson ? data : null);
+    const workflow = typeof rawWorkflow === "string" ? parseWorkflowJson(rawWorkflow) : rawWorkflow;
+    const store = getWorkflowStore();
+    // Include saved workflows in collision checks before creating a local copy.
+    await store?.syncWorkflows?.();
+    const name = getAvailableWorkflowName(file);
+
+    if (workflow && typeof workflow === "object" && !Array.isArray(workflow) && Array.isArray(workflow.nodes)) {
+        // New releases expose createNewTemporary; older tab-enabled releases
+        // only expose createTemporary. Use a collision-free path for both.
+        const create = store?.createNewTemporary ?? store?.createTemporary;
+        const source = create ? create.call(store, `${name}.json`, workflow) : name;
+        // Pass the workflow object through the official graph lifecycle so the
+        // outgoing tab is captured before configure and the new tab owns its
+        // tracker, title, rename action and draft. handleFile catches errors in
+        // this lifecycle and misleadingly reports "no workflow found".
+        const loaded = await app.loadGraphData(workflow, true, true, source, {
+            openSource: "file_drop",
+            deferWarnings: true,
+        });
+        if (loaded === false) throw new Error(`Failed to configure workflow: ${file.name}`);
+        preserveMissingImageSelections();
+        await saveImportedWorkflow(source);
+        return;
+    }
+
+    const rawPrompt = data?.prompt ?? data?.Prompt ?? (isJson ? data : null);
+    const prompt = typeof rawPrompt === "string" ? parseWorkflowJson(rawPrompt) : rawPrompt;
+    if (prompt && typeof prompt === "object" && Object.keys(prompt).length && app.isApiJson?.(prompt)) {
+        await app.loadApiJson(prompt, name, { deferWarnings: true });
+        preserveMissingImageSelections();
+        await saveImportedWorkflow(store?.activeWorkflow);
+        return;
+    }
+
+    if (!isJson && (data?.parameters || data?.templates)) {
+        await app.handleFile(makeUniqueWorkflowSourceFile(file), "file_drop", { deferWarnings: true });
+        preserveMissingImageSelections();
+        return;
+    }
+
+    if (!isJson) {
+        showNoWorkflowToast();
+        return;
+    }
+
+    // Templates/component packs are not graphs. Leave their extension-specific
+    // import behavior alone instead of swallowing real invalid-file warnings.
+    await app.handleFile(file, "file_drop", { deferWarnings: true });
+}
+
+async function saveImportedWorkflow(workflow) {
+    const store = getWorkflowStore();
+    if (!store?.saveWorkflow || !workflow || typeof workflow === "string") return;
+    if (store.activeWorkflow?.path !== workflow.path || !workflow.isTemporary) return;
+    // The native Rename action is disabled for temporary workflows. Persist a
+    // separate local copy through the store, not by falsifying isPersisted or
+    // editing tab DOM. The original dropped file is never modified.
+    await store.saveWorkflow(workflow);
 }
 
 function makeUniqueWorkflowSourceFile(file) {
@@ -337,11 +450,8 @@ app.registerExtension({
             const file = getSingleFile(event);
             if (!file) return;
 
-            // Images dropped on the canvas may contain ComfyUI workflow/prompt
-            // metadata (normally PNG tEXt/iTXt chunks). Delegate to the
-            // official handler so it can restore the graph exactly like the
-            // built-in Ctrl+O/image-drop path. Plain images are handled by the
-            // same fallback as the stock frontend.
+            // Restore the full UI workflow before considering execution-only
+            // prompt data. Node-owned media upload/drop zones were handled above.
             if (isImageFile(file)) {
                 event.preventDefault();
                 event.stopImmediatePropagation();
