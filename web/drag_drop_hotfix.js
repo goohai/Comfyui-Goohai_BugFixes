@@ -303,7 +303,7 @@ async function importWorkflowFile(file) {
         });
         if (loaded === false) throw new Error(`Failed to configure workflow: ${file.name}`);
         preserveMissingImageSelections();
-        await saveImportedWorkflow(source);
+        makeTemporaryWorkflowRenameable(source);
         return;
     }
 
@@ -312,7 +312,7 @@ async function importWorkflowFile(file) {
     if (prompt && typeof prompt === "object" && Object.keys(prompt).length && app.isApiJson?.(prompt)) {
         await app.loadApiJson(prompt, name, { deferWarnings: true });
         preserveMissingImageSelections();
-        await saveImportedWorkflow(store?.activeWorkflow);
+        makeTemporaryWorkflowRenameable(store?.activeWorkflow);
         return;
     }
 
@@ -332,14 +332,22 @@ async function importWorkflowFile(file) {
     await app.handleFile(file, "file_drop", { deferWarnings: true });
 }
 
-async function saveImportedWorkflow(workflow) {
-    const store = getWorkflowStore();
-    if (!store?.saveWorkflow || !workflow || typeof workflow === "string") return;
-    if (store.activeWorkflow?.path !== workflow.path || !workflow.isTemporary) return;
-    // The native Rename action is disabled for temporary workflows. Persist a
-    // separate local copy through the store, not by falsifying isPersisted or
-    // editing tab DOM. The original dropped file is never modified.
-    await store.saveWorkflow(workflow);
+function makeTemporaryWorkflowRenameable(workflow) {
+    if (!workflow?.isTemporary || workflow.isPersisted) return;
+    // ComfyUI disables the native Rename item for temporary root workflows.
+    // Keep the workflow temporary (so closing it removes only in-memory state)
+    // but expose the rename action; UserFile.rename() still updates only the
+    // local path while isTemporary remains true. Manual Save then persists it.
+    try {
+        Object.defineProperty(workflow, "isPersisted", {
+            configurable: true,
+            enumerable: false,
+            get: () => true,
+        });
+    } catch {
+        // Very old reactive wrappers may reject redefining the getter. Loading
+        // remains valid; users can save first and then use native Rename.
+    }
 }
 
 function makeUniqueWorkflowSourceFile(file) {
