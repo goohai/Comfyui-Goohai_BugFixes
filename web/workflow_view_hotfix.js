@@ -1,6 +1,10 @@
 import { app } from "/scripts/app.js";
 
 const PATCH_FLAG = "_goohaiWorkflowViewInstalled";
+// A background tab can pause requestAnimationFrame indefinitely.  Never let
+// the temporary accessor lock survive long enough to make canvas zoom/pan
+// unusable if a load hook or a queued frontend callback is skipped.
+const PIN_MAX_MS = 8000;
 
 function copyView(view) {
     if (!view || !Number.isFinite(view.scale) || view.scale <= 0 ||
@@ -56,11 +60,26 @@ function pinView(canvas, view) {
     }
     ds.computeVisibleArea?.(canvas.viewport);
     canvas.setDirty?.(true, true);
-    return () => {
+
+    let released = false;
+    const release = () => {
+        if (released) return;
+        released = true;
         for (const [key, descriptor] of descriptors) {
-            if (descriptor) Object.defineProperty(ds, key, descriptor);
-            else delete ds[key];
+            try {
+                if (descriptor) Object.defineProperty(ds, key, descriptor);
+                else delete ds[key];
+            } catch {
+                // A single incompatible descriptor must not prevent the
+                // remaining accessors (especially scale/offset) from being
+                // restored.
+            }
         }
+    };
+    const guard = setTimeout(release, PIN_MAX_MS);
+    return () => {
+        clearTimeout(guard);
+        release();
     };
 }
 
@@ -141,7 +160,9 @@ app.registerExtension({
             try {
                 result = await originalLoad.call(this, data, ...args);
             } catch (error) {
-                if (token === restoreToken) stopPinning();
+                // Failed loads must release their own lock even if another
+                // load has already advanced restoreToken.
+                stopPinning();
                 throw error;
             } finally {
                 loading--;
@@ -153,11 +174,10 @@ app.registerExtension({
                 return result;
             }
             // Keep the same view through queued fit-view/layout callbacks.
-            requestAnimationFrame(() => {
-                requestAnimationFrame(() => {
-                    if (token === restoreToken) stopPinning();
-                });
-            });
+            // setTimeout still runs when the tab is backgrounded, unlike rAF.
+            setTimeout(() => {
+                if (token === restoreToken) stopPinning();
+            }, 100);
             return result;
         };
     },
