@@ -86,6 +86,16 @@ function showNoWorkflowToast() {
     });
 }
 
+function showWorkflowLoadError(file, error) {
+    console.error(`Failed to load workflow ${file.name}:`, error);
+    app.extensionManager?.toast?.add?.({
+        severity: "error",
+        summary: "工作流导入失败",
+        detail: `${file.name}：${error.message || String(error)}`,
+        life: 8000,
+    });
+}
+
 function getDeclaredMediaConfigs(node) {
     const inputs = node?.constructor?.nodeData?.input;
     const configs = [];
@@ -303,8 +313,11 @@ async function importWorkflowFile(file) {
         });
         if (loaded === false) throw new Error(`Failed to configure workflow: ${file.name}`);
         preserveMissingImageSelections();
-        makeTemporaryWorkflowRenameable(source);
         return;
+    }
+
+    if (data?.workflow != null || data?.Workflow != null) {
+        throw new Error("完整工作流数据格式无效，已停止导入，避免用执行数据重建并丢失布局。");
     }
 
     const rawPrompt = data?.prompt ?? data?.Prompt ?? (isJson ? data : null);
@@ -312,7 +325,6 @@ async function importWorkflowFile(file) {
     if (prompt && typeof prompt === "object" && Object.keys(prompt).length && app.isApiJson?.(prompt)) {
         await app.loadApiJson(prompt, name, { deferWarnings: true });
         preserveMissingImageSelections();
-        makeTemporaryWorkflowRenameable(store?.activeWorkflow);
         return;
     }
 
@@ -330,24 +342,6 @@ async function importWorkflowFile(file) {
     // Templates/component packs are not graphs. Leave their extension-specific
     // import behavior alone instead of swallowing real invalid-file warnings.
     await app.handleFile(file, "file_drop", { deferWarnings: true });
-}
-
-function makeTemporaryWorkflowRenameable(workflow) {
-    if (!workflow?.isTemporary || workflow.isPersisted) return;
-    // ComfyUI disables the native Rename item for temporary root workflows.
-    // Keep the workflow temporary (so closing it removes only in-memory state)
-    // but expose the rename action; UserFile.rename() still updates only the
-    // local path while isTemporary remains true. Manual Save then persists it.
-    try {
-        Object.defineProperty(workflow, "isPersisted", {
-            configurable: true,
-            enumerable: false,
-            get: () => true,
-        });
-    } catch {
-        // Very old reactive wrappers may reject redefining the getter. Loading
-        // remains valid; users can save first and then use native Rename.
-    }
 }
 
 function makeUniqueWorkflowSourceFile(file) {
@@ -468,7 +462,7 @@ app.registerExtension({
                     showNoWorkflowToast();
                     return undefined;
                 }).catch((error) => {
-                    console.error("Workflow image metadata check failed:", error);
+                    showWorkflowLoadError(file, error);
                 });
                 return;
             }
@@ -478,7 +472,7 @@ app.registerExtension({
             event.preventDefault();
             event.stopImmediatePropagation();
             loadWorkflowFile(file).catch((error) => {
-                console.error("Workflow drop hotfix failed to load the file:", error);
+                showWorkflowLoadError(file, error);
             });
         }, true);
     },

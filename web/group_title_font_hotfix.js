@@ -739,6 +739,7 @@ function installRightDragFontGesture() {
 
     const startGesture = (event, knownGroup = null) => {
         if (event.button !== 2) return false;
+        if (event.target !== canvasElement) return false;
         if (gesture) {
             if (event.pointerId !== gesture.pointerId) return false;
             event.preventDefault();
@@ -777,7 +778,7 @@ function installRightDragFontGesture() {
     // other extensions. Only intercept native group title hits, so third-party
     // node/widget context menus continue to work normally.
     window.addEventListener("pointerdown", (event) => {
-        if (event.button !== 2 || gesture) return;
+        if (event.button !== 2 || gesture || event.target !== canvasElement) return;
         const point = canvas.convertEventToCanvasOffset(event);
         if (point && canvas.graph?.getNodeOnPos?.(point[0], point[1])) return;
         const group = point
